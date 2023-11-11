@@ -1,0 +1,553 @@
+# nginx 启动流程
+
+## main 函数
+
+nginx 的启动流程从 main 函数中开始，main 位于 nginx.c 中。
+
+```C
+//src/core/nginx.c
+/*
+	main
+*/
+int ngx_cdecl
+main(int argc, char *const *argv)
+{
+    ngx_buf_t        *b;
+    ngx_log_t        *log;
+    ngx_uint_t        i;
+    ngx_cycle_t      *cycle, init_cycle;
+    ngx_conf_dump_t  *cd;
+    ngx_core_conf_t  *ccf;
+
+    ngx_debug_init();
+
+    if (ngx_strerror_init() != NGX_OK) {
+        return 1;
+    }
+	//命令行参数解析
+    if (ngx_get_options(argc, argv) != NGX_OK) {
+        return 1;
+    }
+	//展示版本信息
+    if (ngx_show_version) {
+        ngx_show_version_info();
+
+        if (!ngx_test_config) {
+            return 0;
+        }
+    }
+
+    /* TODO */ ngx_max_sockets = -1;
+	//时间缓存初始化
+    ngx_time_init();
+
+#if (NGX_PCRE)
+    ngx_regex_init();
+#endif
+	//获取 pid 和 ppid
+    ngx_pid = ngx_getpid();
+    ngx_parent = ngx_getppid();
+	//日志初始化
+    log = ngx_log_init(ngx_prefix, ngx_error_log);
+    if (log == NULL) {
+        return 1;
+    }
+
+    /* STUB */
+#if (NGX_OPENSSL)
+    ngx_ssl_init(log);
+#endif
+
+    /*
+     * init_cycle->log is required for signal handlers and
+     * ngx_process_options()
+     */
+	//简单初始化 init_cycle
+    ngx_memzero(&init_cycle, sizeof(ngx_cycle_t));
+    init_cycle.log = log;
+    ngx_cycle = &init_cycle;
+	//为 init_cycle 分配一个内存池
+    init_cycle.pool = ngx_create_pool(1024, log);
+    if (init_cycle.pool == NULL) {
+        return 1;
+    }
+	//将 nginx 命令行中的参数保存到全局变量 ngx_argv 中
+    if (ngx_save_argv(&init_cycle, argc, argv) != NGX_OK) {
+        return 1;
+    }
+	//根据 ngx_get_options 中对命令行的解析情况对 init_cycle 中对应的成员进行设置
+    if (ngx_process_options(&init_cycle) != NGX_OK) {
+        return 1;
+    }
+	//初始化系统相关变量，如页面大小、chacheline 大小、最大连接数大小 ngx_max_sockets、随机数种子初始化等
+    if (ngx_os_init(log) != NGX_OK) {
+        return 1;
+    }
+
+    /*
+     * ngx_crc32_table_init() requires ngx_cacheline_size set in ngx_os_init()
+     */
+	//初始化一致性哈希表
+    if (ngx_crc32_table_init() != NGX_OK) {
+        return 1;
+    }
+
+    /*
+     * ngx_slab_sizes_init() requires ngx_pagesize set in ngx_os_init()
+     */
+	//slab 机制相关变量初始化
+    ngx_slab_sizes_init();
+	//继承父进程的 socket，主要用于平滑升级
+    if (ngx_add_inherited_sockets(&init_cycle) != NGX_OK) {
+        return 1;
+    }
+	//模块前置初始化，初始化模块编号以及模块 name，涉及全局变量 ngx_modules 以及 ngx_modules_n
+    if (ngx_preinit_modules() != NGX_OK) {
+        return 1;
+    }
+
+    cycle = ngx_init_cycle(&init_cycle);//初始化全局变量 cycle
+    if (cycle == NULL) {
+        if (ngx_test_config) {
+            ngx_log_stderr(0, "configuration file %s test failed",
+                           init_cycle.conf_file.data);
+        }
+
+        return 1;
+    }
+
+    if (ngx_test_config) {
+        if (!ngx_quiet_mode) {
+            ngx_log_stderr(0, "configuration file %s test is successful",
+                           cycle->conf_file.data);
+        }
+
+        if (ngx_dump_config) {
+            cd = cycle->config_dump.elts;
+
+            for (i = 0; i < cycle->config_dump.nelts; i++) {
+
+                ngx_write_stdout("# configuration file ");
+                (void) ngx_write_fd(ngx_stdout, cd[i].name.data,
+                                    cd[i].name.len);
+                ngx_write_stdout(":" NGX_LINEFEED);
+
+                b = cd[i].buffer;
+
+                (void) ngx_write_fd(ngx_stdout, b->pos, b->last - b->pos);
+                ngx_write_stdout(NGX_LINEFEED);
+            }
+        }
+
+        return 0;
+    }
+	//指定 -s 选项
+    if (ngx_signal) {
+        return ngx_signal_process(cycle, ngx_signal);
+    }
+
+    ngx_os_status(cycle->log);
+
+    ngx_cycle = cycle;
+
+    ccf = (ngx_core_conf_t *) ngx_get_conf(cycle->conf_ctx, ngx_core_module);
+
+    if (ccf->master && ngx_process == NGX_PROCESS_SINGLE) {
+        ngx_process = NGX_PROCESS_MASTER;
+    }
+
+#if !(NGX_WIN32)
+	//信号初始化
+    if (ngx_init_signals(cycle->log) != NGX_OK) {
+        return 1;
+    }
+	//daemon 模式
+    if (!ngx_inherited && ccf->daemon) {
+        if (ngx_daemon(cycle->log) != NGX_OK) {
+            return 1;
+        }
+
+        ngx_daemonized = 1;
+    }
+
+    if (ngx_inherited) {
+        ngx_daemonized = 1;
+    }
+
+#endif
+	//创建 pid 文件
+    if (ngx_create_pidfile(&ccf->pid, cycle->log) != NGX_OK) {
+        return 1;
+    }
+
+    if (ngx_log_redirect_stderr(cycle) != NGX_OK) {
+        return 1;
+    }
+
+    if (log->file->fd != ngx_stderr) {
+        if (ngx_close_file(log->file->fd) == NGX_FILE_ERROR) {
+            ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
+                          ngx_close_file_n " built-in log failed");
+        }
+    }
+
+    ngx_use_stderr = 0;
+	//根据配置决定进入单进程模式还是多进程模式
+    if (ngx_process == NGX_PROCESS_SINGLE) {
+        ngx_single_process_cycle(cycle);
+
+    } else {
+        ngx_master_process_cycle(cycle);
+    }
+
+    return 0;
+}
+```
+
+## cycle 初始化
+
+cycle 是 nginx 的核心运行时结构体，类型为 ngx_cycle_t。在 `ngx_init_cycle` 中，nginx 完成了对 cycle 的初始化过程。
+
+```C
+//src/core/ngx_core.h
+typedef struct ngx_cycle_s           ngx_cycle_t;
+
+//src/core/ngx_cycle.h
+struct ngx_cycle_s {
+    void                  ****conf_ctx;//保存所有模块配置结构的指针
+    ngx_pool_t               *pool;//用于 ngx_cycle_t 内存池
+	//日志对象
+    ngx_log_t                *log;
+    ngx_log_t                 new_log;
+
+    ngx_uint_t                log_use_stderr;  /* unsigned  log_use_stderr:1; */
+
+    ngx_connection_t        **files;//文件句柄
+    ngx_connection_t         *free_connections;//可用连接池
+    ngx_uint_t                free_connection_n;//可用连接池中连接的总数
+	//模块信息
+    ngx_module_t            **modules;
+    ngx_uint_t                modules_n;
+    ngx_uint_t                modules_used;    /* unsigned  modules_used:1; */
+
+    ngx_queue_t               reusable_connections_queue;
+    ngx_uint_t                reusable_connections_n;
+    time_t                    connections_reuse_time;
+
+    ngx_array_t               listening;//监听的端口以及参数
+    ngx_array_t               paths;//保存 nginx 所要操作的目录
+
+    ngx_array_t               config_dump;
+    ngx_rbtree_t              config_dump_rbtree;
+    ngx_rbtree_node_t         config_dump_sentinel;
+
+    ngx_list_t                open_files;//标识 nginx 已经打开的所有文件
+    ngx_list_t                shared_memory;//保存共享内存的链表
+
+    ngx_uint_t                connection_n;//进程中所有连接对象的总数
+    ngx_uint_t                files_n;
+
+    ngx_connection_t         *connections;//指向当前进程中的所有连接对象
+    ngx_event_t              *read_events;//指向当前进程中的所有读事件对象
+    ngx_event_t              *write_events;//指向当前进程中的所有写事件对象
+
+    ngx_cycle_t              *old_cycle;//初始化时的临时 cycle
+
+    ngx_str_t                 conf_file;//配置文件相对于安装目录的路径名称
+    ngx_str_t                 conf_param;//处理配置文件时需要特殊处理的在命令行携带的参数，一般是 -g 选项携带的参数
+    ngx_str_t                 conf_prefix;//配置文件所在目录的路径
+    ngx_str_t                 prefix;//安装目录的路径
+    ngx_str_t                 error_log;
+    ngx_str_t                 lock_file;//用于进程间同步的文件锁
+    ngx_str_t                 hostname;//主机名
+};
+
+//src/core/ngx_cycle.c
+/*
+	初始化 cycle 变量
+*/
+ngx_cycle_t *
+ngx_init_cycle(ngx_cycle_t *old_cycle)
+{
+    for (i = 0; cycle->modules[i]; i++) {//+231 调用所有模块的 create_conf 方法
+        if (cycle->modules[i]->type != NGX_CORE_MODULE) {
+            continue;
+        }
+
+        module = cycle->modules[i]->ctx;
+
+        if (module->create_conf) {
+            rv = module->create_conf(cycle);
+            if (rv == NULL) {
+                ngx_destroy_pool(pool);
+                return NULL;
+            }
+            cycle->conf_ctx[cycle->modules[i]->index] = rv;
+        }
+    }
+    
+    if (ngx_conf_param(&conf) != NGX_CONF_OK) {//+278 解析命令行中的配置参数，内部调用 ngx_conf_parse
+        environ = senv;
+        ngx_destroy_cycle_pools(&conf);
+        return NULL;
+    }
+
+    if (ngx_conf_parse(&conf, &cycle->conf_file) != NGX_CONF_OK) {//+284 解析配置文件
+        environ = senv;
+        ngx_destroy_cycle_pools(&conf);
+        return NULL;
+    }
+    
+    for (i = 0; cycle->modules[i]; i++) {//+295 调用所有 core 模块的 init_conf 方法
+        if (cycle->modules[i]->type != NGX_CORE_MODULE) {
+            continue;
+        }
+
+        module = cycle->modules[i]->ctx;
+
+        if (module->init_conf) {
+            if (module->init_conf(cycle,
+                                  cycle->conf_ctx[cycle->modules[i]->index])
+                == NGX_CONF_ERROR)
+            {
+                environ = senv;
+                ngx_destroy_cycle_pools(&conf);
+                return NULL;
+            }
+        }
+    }
+    
+    part = &cycle->open_files.part;//+365 打开 cycle->open_files 中的文件
+    file = part->elts;
+
+    for (i = 0; /* void */ ; i++) {
+        /*...*/
+    }
+    
+    /* create shared memory *///+413 创建共享内存
+
+    part = &cycle->shared_memory.part;
+    shm_zone = part->elts;
+
+    for (i = 0; /* void */ ; i++) {
+		/*...*/
+        if (ngx_init_zone_pool(cycle, &shm_zone[i]) != NGX_OK) {
+            goto failed;
+        }
+
+        if (shm_zone[i].init(&shm_zone[i], NULL) != NGX_OK) {
+            goto failed;
+        }
+
+    shm_zone_found:
+
+        continue;
+    }
+    
+    if (ngx_open_listening_sockets(cycle) != NGX_OK) {//+619 循环监听所有监听 fd
+        goto failed;
+    }
+    
+    if (ngx_init_modules(cycle) != NGX_OK) {//+636 调用所有模块的 init_module 方法
+        /* fatal */
+        exit(1);
+    }
+}
+```
+
+## worker 进程的初始化
+
+master 进程的初始化工作在《进程管理》中已经介绍，这里看一下 worker 进程的初始化过程。
+
+```C
+//src/os/unix/ngx_process_cycle.c
+/*
+	worker 进程初始化
+*/
+static void
+ngx_worker_process_init(ngx_cycle_t *cycle, ngx_int_t worker)
+{
+    sigset_t          set;
+    ngx_int_t         n;
+    ngx_time_t       *tp;
+    ngx_uint_t        i;
+    ngx_cpuset_t     *cpu_affinity;
+    struct rlimit     rlmt;
+    ngx_core_conf_t  *ccf;
+
+    if (ngx_set_environment(cycle, NULL) == NULL) {
+        /* fatal */
+        exit(2);
+    }
+
+    ccf = (ngx_core_conf_t *) ngx_get_conf(cycle->conf_ctx, ngx_core_module);
+
+    if (worker >= 0 && ccf->priority != 0) {//设置进程优先级
+        if (setpriority(PRIO_PROCESS, 0, ccf->priority) == -1) {
+            ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
+                          "setpriority(%d) failed", ccf->priority);
+        }
+    }
+	//设置资源使用限制
+    if (ccf->rlimit_nofile != NGX_CONF_UNSET) {//对应于指令 worker_rlimit_nofile
+        rlmt.rlim_cur = (rlim_t) ccf->rlimit_nofile;
+        rlmt.rlim_max = (rlim_t) ccf->rlimit_nofile;
+
+        if (setrlimit(RLIMIT_NOFILE, &rlmt) == -1) {
+            ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
+                          "setrlimit(RLIMIT_NOFILE, %i) failed",
+                          ccf->rlimit_nofile);
+        }
+    }
+
+    if (ccf->rlimit_core != NGX_CONF_UNSET) {//对应于指令 worker_rlimit_core
+        rlmt.rlim_cur = (rlim_t) ccf->rlimit_core;
+        rlmt.rlim_max = (rlim_t) ccf->rlimit_core;
+
+        if (setrlimit(RLIMIT_CORE, &rlmt) == -1) {
+            ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
+                          "setrlimit(RLIMIT_CORE, %O) failed",
+                          ccf->rlimit_core);
+        }
+    }
+
+    if (geteuid() == 0) {//条件成立说明当前进程具有 root 权限
+        if (setgid(ccf->group) == -1) {//ccf->group 解析得到的 GID
+            ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
+                          "setgid(%d) failed", ccf->group);
+            /* fatal */
+            exit(2);
+        }
+
+        if (initgroups(ccf->username, ccf->group) == -1) {//修改附加 GID
+            ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
+                          "initgroups(%s, %d) failed",
+                          ccf->username, ccf->group);
+        }
+
+#if (NGX_HAVE_PR_SET_KEEPCAPS && NGX_HAVE_CAPABILITIES)
+        if (ccf->transparent && ccf->user) {
+            if (prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0) == -1) {
+                ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
+                              "prctl(PR_SET_KEEPCAPS, 1) failed");
+                /* fatal */
+                exit(2);
+            }
+        }
+#endif
+
+        if (setuid(ccf->user) == -1) {//设置 uid
+            ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
+                          "setuid(%d) failed", ccf->user);
+            /* fatal */
+            exit(2);
+        }
+
+#if (NGX_HAVE_CAPABILITIES)
+        if (ccf->transparent && ccf->user) {
+            struct __user_cap_data_struct    data;
+            struct __user_cap_header_struct  header;
+
+            ngx_memzero(&header, sizeof(struct __user_cap_header_struct));
+            ngx_memzero(&data, sizeof(struct __user_cap_data_struct));
+
+            header.version = _LINUX_CAPABILITY_VERSION_1;
+            data.effective = CAP_TO_MASK(CAP_NET_RAW);
+            data.permitted = data.effective;
+
+            if (syscall(SYS_capset, &header, &data) == -1) {
+                ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
+                              "capset() failed");
+                /* fatal */
+                exit(2);
+            }
+        }
+#endif
+    }
+
+    if (worker >= 0) {//设置 cpu 亲和度
+        cpu_affinity = ngx_get_cpu_affinity(worker);
+
+        if (cpu_affinity) {
+            ngx_setaffinity(cpu_affinity, cycle->log);
+        }
+    }
+
+#if (NGX_HAVE_PR_SET_DUMPABLE)
+
+    /* allow coredump after setuid() in Linux 2.4.x */
+
+    if (prctl(PR_SET_DUMPABLE, 1, 0, 0, 0) == -1) {
+        ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
+                      "prctl(PR_SET_DUMPABLE) failed");
+    }
+
+#endif
+
+    if (ccf->working_directory.len) {
+        if (chdir((char *) ccf->working_directory.data) == -1) {
+            ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
+                          "chdir(\"%s\") failed", ccf->working_directory.data);
+            /* fatal */
+            exit(2);
+        }
+    }
+
+    sigemptyset(&set);
+
+    if (sigprocmask(SIG_SETMASK, &set, NULL) == -1) {
+        ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
+                      "sigprocmask() failed");
+    }
+
+    tp = ngx_timeofday();
+    srandom(((unsigned) ngx_pid << 16) ^ tp->sec ^ tp->msec);
+
+    for (i = 0; cycle->modules[i]; i++) {//调用所有模块的 init_process 方法
+        if (cycle->modules[i]->init_process) {
+            if (cycle->modules[i]->init_process(cycle) == NGX_ERROR) {
+                /* fatal */
+                exit(2);
+            }
+        }
+    }
+
+    for (n = 0; n < ngx_last_process; n++) {//对进程池中的 channel 进行处理
+
+        if (ngx_processes[n].pid == -1) {
+            continue;
+        }
+
+        if (n == ngx_process_slot) {
+            continue;
+        }
+
+        if (ngx_processes[n].channel[1] == -1) {
+            continue;
+        }
+
+        if (close(ngx_processes[n].channel[1]) == -1) {//关闭其他进程的 channel[1]
+            ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
+                          "close() channel failed");
+        }
+    }
+
+    if (close(ngx_processes[ngx_process_slot].channel[0]) == -1) {//关闭自身的 channel[0]
+        ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
+                      "close() channel failed");
+    }
+
+#if 0
+    ngx_last_process = 0;
+#endif
+
+    if (ngx_add_channel_event(cycle, ngx_channel, NGX_READ_EVENT,//把自身的 channel[1] 加入事件模型，设置回调函数为 ngx_channel_handler
+                              ngx_channel_handler)
+        == NGX_ERROR)
+    {
+        /* fatal */
+        exit(2);
+    }
+}
+```
+
